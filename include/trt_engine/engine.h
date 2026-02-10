@@ -1,6 +1,7 @@
 #pragma once
 
 #include <NvInfer.h>
+#include <trt_engine/cuda_graph.h>
 #include <trt_engine/cuda_utils.h>
 #include <trt_engine/logger.h>
 #include <trt_engine/memory.h>
@@ -22,10 +23,13 @@ namespace trt_engine {
 
 // ── Engine configuration ─────────────────────────────────────────────────
 struct EngineConfig {
-    int    device_id          = 0;
-    int    context_pool_size  = 2;
-    bool   enable_cuda_graph  = false;
-    int    thread_pool_size   = 2;
+    int    device_id              = 0;
+    int    context_pool_size      = 2;
+    bool   enable_cuda_graph      = false;
+    int    thread_pool_size       = 2;
+    int    num_pipeline_streams   = 1;  // Number of streams for pipelining (1 = no pipelining)
+    SyncMode sync_mode            = SyncMode::BLOCKING;
+    uint64_t hybrid_spin_ns       = 100000;  // 100us default for HYBRID mode
 };
 
 // ── Exception type ───────────────────────────────────────────────────────
@@ -64,6 +68,15 @@ public:
     // Call after set_input_shape() and before infer() in perf-critical loops.
     // This enables the zero-allocation fast path in run_inference().
     void prepare_buffers();
+
+    // Pre-allocate pipeline resources for multi-stream pipelining.
+    // Call after set_input_shape() to create N sets of buffers/streams.
+    void prepare_pipeline();
+
+    // Pipelined inference: process multiple inference requests across N streams.
+    // Each element in batch_inputs is one complete set of input buffers for one inference call.
+    std::vector<InferenceResult> infer_pipelined(
+        const std::vector<std::vector<std::vector<float>>>& batch_inputs);
 
     // Query tensor information
     std::vector<TensorInfo> get_input_info() const;
@@ -124,6 +137,29 @@ private:
         bool ready = false;
     };
     PreparedBuffers prepared_;
+
+    // CUDA graph manager for multi-shape graph caching
+    CudaGraphManager graph_manager_;
+
+    // Pre-allocated pipeline resources for multi-stream pipelining
+    struct PipelineStreamSet {
+        CudaStream stream;
+        CudaEvent start_event;
+        CudaEvent end_event;
+        std::vector<DeviceBuffer> input_device_bufs;
+        std::vector<DeviceBuffer> output_device_bufs;
+        std::vector<PinnedBuffer> input_pinned_bufs;
+    };
+    struct PipelineResources {
+        std::vector<std::string> input_names;
+        std::vector<std::string> output_names;
+        std::vector<size_t> input_byte_sizes;
+        std::vector<size_t> output_elem_counts;
+        std::vector<std::pair<std::string, nvinfer1::Dims>> cached_shapes;
+        std::vector<std::unique_ptr<PipelineStreamSet>> stream_sets;
+        bool ready = false;
+    };
+    PipelineResources pipeline_;
 
     // Thread pool for async inference
     std::vector<std::thread>                     workers_;

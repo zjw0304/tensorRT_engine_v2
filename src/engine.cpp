@@ -206,6 +206,7 @@ void InferenceEngine::set_input_shape(const std::string& name,
     shape_overrides_[name] = dims;
     // Invalidate prepared buffers when shapes change
     prepared_.ready = false;
+    pipeline_.ready = false;
 }
 
 // ── Buffer pre-allocation ───────────────────────────────────────────────
@@ -297,6 +298,235 @@ void InferenceEngine::prepare_buffers() {
     prepared_.ready = true;
 }
 
+// ── Pipeline pre-allocation ─────────────────────────────────────────────
+
+void InferenceEngine::prepare_pipeline() {
+    CUDA_CHECK(cudaSetDevice(config_.device_id));
+
+    int num_streams = config_.num_pipeline_streams;
+    if (num_streams < 1) {
+        throw EngineException("num_pipeline_streams must be >= 1");
+    }
+
+    pipeline_.input_names.clear();
+    pipeline_.output_names.clear();
+    pipeline_.input_byte_sizes.clear();
+    pipeline_.output_elem_counts.clear();
+    pipeline_.cached_shapes.clear();
+    pipeline_.stream_sets.clear();
+    pipeline_.ready = false;
+
+    // Collect tensor names
+    int nb_io = engine_->getNbIOTensors();
+    for (int i = 0; i < nb_io; ++i) {
+        const char* name = engine_->getIOTensorName(i);
+        if (engine_->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT) {
+            pipeline_.input_names.emplace_back(name);
+        } else {
+            pipeline_.output_names.emplace_back(name);
+        }
+    }
+
+    // We need a temporary context to resolve output shapes
+    auto ctx = acquire_context();
+
+    // Cache shape overrides
+    {
+        std::lock_guard<std::mutex> slock(shape_mutex_);
+        for (auto& [name, dims] : shape_overrides_) {
+            nvinfer1::Dims trt_dims;
+            trt_dims.nbDims = static_cast<int>(dims.size());
+            for (int d = 0; d < trt_dims.nbDims; ++d) {
+                trt_dims.d[d] = dims[d];
+            }
+            ctx->setInputShape(name.c_str(), trt_dims);
+            pipeline_.cached_shapes.emplace_back(name, trt_dims);
+        }
+    }
+
+    // Compute input byte sizes
+    for (const auto& name : pipeline_.input_names) {
+        std::lock_guard<std::mutex> slock(shape_mutex_);
+        auto it = shape_overrides_.find(name);
+        size_t byte_size;
+        if (it != shape_overrides_.end()) {
+            int64_t vol = 1;
+            for (int d : it->second) vol *= d;
+            nvinfer1::DataType dt = engine_->getTensorDataType(name.c_str());
+            byte_size = static_cast<size_t>(vol) * datatype_size(dt);
+        } else {
+            nvinfer1::Dims dims = engine_->getTensorShape(name.c_str());
+            int64_t vol = volume(dims);
+            nvinfer1::DataType dt = engine_->getTensorDataType(name.c_str());
+            byte_size = static_cast<size_t>(vol) * datatype_size(dt);
+        }
+        pipeline_.input_byte_sizes.push_back(byte_size);
+    }
+
+    // Compute output element counts
+    for (const auto& name : pipeline_.output_names) {
+        nvinfer1::Dims dims = ctx->getTensorShape(name.c_str());
+        int64_t vol = volume(dims);
+        if (vol <= 0) {
+            dims = engine_->getTensorShape(name.c_str());
+            vol = volume(dims);
+        }
+        pipeline_.output_elem_counts.push_back(static_cast<size_t>(vol));
+    }
+
+    release_context(std::move(ctx));
+
+    // Allocate N stream sets
+    for (int s = 0; s < num_streams; ++s) {
+        auto ss = std::make_unique<PipelineStreamSet>();
+
+        // Allocate per-stream input buffers
+        for (size_t i = 0; i < pipeline_.input_names.size(); ++i) {
+            ss->input_device_bufs.emplace_back(pipeline_.input_byte_sizes[i]);
+            ss->input_pinned_bufs.emplace_back(pipeline_.input_byte_sizes[i]);
+        }
+
+        // Allocate per-stream output buffers
+        for (size_t i = 0; i < pipeline_.output_names.size(); ++i) {
+            nvinfer1::DataType dt = engine_->getTensorDataType(
+                pipeline_.output_names[i].c_str());
+            size_t byte_size = pipeline_.output_elem_counts[i] * datatype_size(dt);
+            ss->output_device_bufs.emplace_back(byte_size);
+        }
+
+        pipeline_.stream_sets.push_back(std::move(ss));
+    }
+
+    pipeline_.ready = true;
+}
+
+// ── Pipelined inference ─────────────────────────────────────────────────
+
+std::vector<InferenceResult> InferenceEngine::infer_pipelined(
+    const std::vector<std::vector<std::vector<float>>>& batch_inputs) {
+
+    size_t num_requests = batch_inputs.size();
+    std::vector<InferenceResult> results(num_requests);
+
+    if (num_requests == 0) {
+        return results;
+    }
+
+    if (!pipeline_.ready) {
+        throw EngineException("Pipeline not prepared. Call prepare_pipeline() first.");
+    }
+
+    CUDA_CHECK(cudaSetDevice(config_.device_id));
+
+    int num_streams = static_cast<int>(pipeline_.stream_sets.size());
+
+    // Acquire contexts - one per stream
+    std::vector<UniqueContext> contexts;
+    contexts.reserve(num_streams);
+    for (int s = 0; s < num_streams; ++s) {
+        contexts.push_back(acquire_context());
+    }
+
+    try {
+        // Apply cached shapes to all contexts
+        for (int s = 0; s < num_streams; ++s) {
+            for (const auto& [name, trt_dims] : pipeline_.cached_shapes) {
+                contexts[s]->setInputShape(name.c_str(), trt_dims);
+            }
+        }
+
+        // Dispatch requests round-robin across streams
+        for (size_t r = 0; r < num_requests; ++r) {
+            int s = static_cast<int>(r % num_streams);
+            auto& ss = *pipeline_.stream_sets[s];
+            auto& ctx = contexts[s];
+            auto stream = ss.stream.get();
+
+            const auto& inputs = batch_inputs[r];
+            results[r].success = false;
+
+            if (inputs.size() != pipeline_.input_names.size()) {
+                results[r].error_msg = "Input count mismatch for request " +
+                                       std::to_string(r) + ": expected " +
+                                       std::to_string(pipeline_.input_names.size()) +
+                                       " got " + std::to_string(inputs.size());
+                continue;
+            }
+
+            // Copy inputs H2D on this stream
+            for (size_t i = 0; i < pipeline_.input_names.size(); ++i) {
+                size_t byte_size = inputs[i].size() * sizeof(float);
+                std::memcpy(ss.input_pinned_bufs[i].data(),
+                            inputs[i].data(), byte_size);
+                async_memcpy_h2d(ss.input_device_bufs[i].data(),
+                                 ss.input_pinned_bufs[i].data(),
+                                 byte_size, stream);
+                ctx->setTensorAddress(pipeline_.input_names[i].c_str(),
+                                      ss.input_device_bufs[i].data());
+            }
+
+            // Bind outputs on this stream
+            for (size_t i = 0; i < pipeline_.output_names.size(); ++i) {
+                ctx->setTensorAddress(pipeline_.output_names[i].c_str(),
+                                      ss.output_device_bufs[i].data());
+            }
+
+            // Record start event and enqueue
+            ss.start_event.record(stream);
+
+            if (!ctx->enqueueV3(stream)) {
+                results[r].error_msg = "enqueueV3 failed for request " +
+                                       std::to_string(r);
+                continue;
+            }
+
+            ss.end_event.record(stream);
+
+            // Copy outputs D2H on this stream
+            results[r].outputs.resize(pipeline_.output_names.size());
+            for (size_t i = 0; i < pipeline_.output_names.size(); ++i) {
+                results[r].outputs[i].resize(pipeline_.output_elem_counts[i]);
+                async_memcpy_d2h(results[r].outputs[i].data(),
+                                 ss.output_device_bufs[i].data(),
+                                 pipeline_.output_elem_counts[i] * sizeof(float),
+                                 stream);
+            }
+
+            results[r].success = true;
+        }
+
+        // Synchronize all streams
+        for (int s = 0; s < num_streams; ++s) {
+            pipeline_.stream_sets[s]->stream.synchronize();
+        }
+
+        // Collect timing from events
+        for (size_t r = 0; r < num_requests; ++r) {
+            if (results[r].success) {
+                int s = static_cast<int>(r % num_streams);
+                auto& ss = *pipeline_.stream_sets[s];
+                results[r].latency_ms = CudaEvent::elapsed_time(
+                    ss.start_event, ss.end_event);
+            }
+        }
+
+    } catch (const std::exception& e) {
+        // On exception, mark remaining results as failed
+        for (size_t r = 0; r < num_requests; ++r) {
+            if (!results[r].success && results[r].error_msg.empty()) {
+                results[r].error_msg = e.what();
+            }
+        }
+    }
+
+    // Release all contexts
+    for (auto& ctx : contexts) {
+        release_context(std::move(ctx));
+    }
+
+    return results;
+}
+
 // ── Core inference ──────────────────────────────────────────────────────
 
 InferenceResult InferenceEngine::run_inference(
@@ -345,10 +575,31 @@ InferenceResult InferenceEngine::run_inference(
             // Measure and run
             prepared_.start_event->record(stream);
 
-            if (!ctx->enqueueV3(stream)) {
-                result.error_msg = "enqueueV3 failed";
-                release_context(std::move(ctx));
-                return result;
+            // CUDA graph path: try to launch a cached graph, or capture one
+            if (config_.enable_cuda_graph && !prepared_.cached_shapes.empty()) {
+                auto graph_key = CudaGraphManager::make_key(prepared_.cached_shapes);
+                if (graph_manager_.has_graph(graph_key)) {
+                    if (!graph_manager_.launch(graph_key, stream)) {
+                        result.error_msg = "CUDA graph launch failed";
+                        release_context(std::move(ctx));
+                        return result;
+                    }
+                } else {
+                    if (!graph_manager_.capture(graph_key, ctx.get(), stream)) {
+                        get_logger().warning("CUDA graph capture failed, falling back to enqueueV3");
+                        if (!ctx->enqueueV3(stream)) {
+                            result.error_msg = "enqueueV3 failed";
+                            release_context(std::move(ctx));
+                            return result;
+                        }
+                    }
+                }
+            } else {
+                if (!ctx->enqueueV3(stream)) {
+                    result.error_msg = "enqueueV3 failed";
+                    release_context(std::move(ctx));
+                    return result;
+                }
             }
 
             prepared_.end_event->record(stream);
@@ -363,7 +614,8 @@ InferenceResult InferenceEngine::run_inference(
                                  stream);
             }
 
-            prepared_.stream->synchronize();
+            sync_stream(*prepared_.stream, *prepared_.end_event,
+                        config_.sync_mode, config_.hybrid_spin_ns);
             result.latency_ms = CudaEvent::elapsed_time(*prepared_.start_event,
                                                          *prepared_.end_event);
             result.success = true;
@@ -494,7 +746,7 @@ InferenceResult InferenceEngine::run_inference(
         }
 
         // Synchronize and compute latency
-        stream.synchronize();
+        sync_stream(stream, end_event, config_.sync_mode, config_.hybrid_spin_ns);
         result.latency_ms = CudaEvent::elapsed_time(start_event, end_event);
         result.success = true;
 

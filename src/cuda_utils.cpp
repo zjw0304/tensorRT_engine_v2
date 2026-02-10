@@ -1,5 +1,6 @@
 #include <trt_engine/cuda_utils.h>
 
+#include <chrono>
 #include <stdexcept>
 
 namespace trt_engine {
@@ -166,6 +167,56 @@ DeviceProperties get_device_properties(int device_id) {
     dp.memory_bus_width_bits     = props.memoryBusWidth;
 
     return dp;
+}
+
+// ── Spin-wait synchronization ───────────────────────────────────────────
+
+void spin_wait_event(const CudaEvent& event) {
+    while (true) {
+        cudaError_t status = cudaEventQuery(event.get());
+        if (status == cudaSuccess) {
+            return;
+        }
+        if (status != cudaErrorNotReady) {
+            CUDA_CHECK(status);
+        }
+    }
+}
+
+void hybrid_wait_event(const CudaEvent& event, cudaStream_t stream,
+                       uint64_t spin_ns) {
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        cudaError_t status = cudaEventQuery(event.get());
+        if (status == cudaSuccess) {
+            return;
+        }
+        if (status != cudaErrorNotReady) {
+            CUDA_CHECK(status);
+        }
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        if (static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed)
+                    .count()) >= spin_ns) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            return;
+        }
+    }
+}
+
+void sync_stream(CudaStream& stream, CudaEvent& event, SyncMode mode,
+                 uint64_t hybrid_spin_ns) {
+    switch (mode) {
+        case SyncMode::BLOCKING:
+            stream.synchronize();
+            break;
+        case SyncMode::SPIN_WAIT:
+            spin_wait_event(event);
+            break;
+        case SyncMode::HYBRID:
+            hybrid_wait_event(event, stream.get(), hybrid_spin_ns);
+            break;
+    }
 }
 
 }  // namespace trt_engine

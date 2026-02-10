@@ -47,6 +47,9 @@ The library is a single shared library (`libtrt_engine.so`) built from 12 source
 ### Advanced Features (layered on top of InferenceEngine)
 
 - **CudaGraphExecutor** (`cuda_graph.h/cpp`) — Captures and replays CUDA graphs for reduced kernel launch overhead.
+- **CudaGraphManager** (`cuda_graph.h/cpp`) — Multi-shape graph caching. Stores captured graphs keyed by input shape configuration (e.g., `"input_ids:1x128,attention_mask:1x128"`). Automatically captures new graphs on first encounter of a shape; subsequent calls replay the cached graph. Enabled via `EngineConfig::enable_cuda_graph = true`. Provides ~19% latency reduction on BERT inference.
+- **Multi-Stream Pipelining** (integrated in `engine.h/cpp`) — `prepare_pipeline()` pre-allocates N sets of CUDA streams, events, and device/pinned buffers. `infer_pipelined()` dispatches requests round-robin across streams with overlapping H2D transfers, compute, and D2H readback. Configured via `EngineConfig::num_pipeline_streams` (default 1 = sequential).
+- **Spin-Wait Synchronization** (`cuda_utils.h/cpp`, `types.h`) — Three CUDA synchronization modes via `SyncMode` enum: `BLOCKING` (default, `cudaStreamSynchronize()`), `SPIN_WAIT` (busy-loop on `cudaEventQuery()`, lowest latency), `HYBRID` (spin for configurable nanoseconds then fall back to blocking). Configured via `EngineConfig::sync_mode` and `EngineConfig::hybrid_spin_ns`.
 - **MultiStreamEngine** (`multi_stream.h/cpp`) — Worker-per-stream architecture with work-stealing queue.
 - **DynamicBatcher** (`batcher.h/cpp`) — Collects individual requests into batches (by count or timeout), returns futures.
 - **MultiGPUEngine** (`multi_gpu.h/cpp`) — One InferenceEngine per GPU, round-robin load balancing.
@@ -55,7 +58,7 @@ The library is a single shared library (`libtrt_engine.so`) built from 12 source
 
 - **Logger** (`logger.h/cpp`) — Thread-safe singleton implementing `nvinfer1::ILogger`. Macros: `CUDA_CHECK`, `TRT_CHECK`.
 - **Memory** (`memory.h/cpp`) — `GpuAllocator` (implements `nvinfer1::IGpuAllocator`), `DeviceBuffer`, `PinnedBuffer` RAII wrappers, `MemoryManager` with allocation tracking.
-- **CudaUtils** (`cuda_utils.h/cpp`) — `CudaStream`, `CudaEvent`, `StreamPool` RAII wrappers; async memcpy helpers.
+- **CudaUtils** (`cuda_utils.h/cpp`) — `CudaStream`, `CudaEvent`, `StreamPool` RAII wrappers; async memcpy helpers; `spin_wait_event()`, `hybrid_wait_event()`, `sync_stream()` synchronization functions.
 - **Calibrator** (`calibrator.h/cpp`) — `EntropyCalibratorV2` and `MinMaxCalibrator` for INT8 quantization from binary calibration data files.
 - **Profiler** (`profiler.h/cpp`) — Layer-level timing (`TRTProfiler` via `nvinfer1::IProfiler`), high-level `PerformanceProfiler` with percentile stats, GPU metrics via NVML.
 
@@ -67,7 +70,7 @@ The library is a single shared library (`libtrt_engine.so`) built from 12 source
 
 - `DynamicShapeProfile` — `{name, min_dims, opt_dims, max_dims}` for optimization profiles
 - `BuilderConfig` — precision, workspace, dynamic_shapes, DLA, timing cache, strongly_typed
-- `EngineConfig` — device_id, context_pool_size, enable_cuda_graph, thread_pool_size
+- `EngineConfig` — device_id, context_pool_size, enable_cuda_graph, thread_pool_size, num_pipeline_streams, sync_mode, hybrid_spin_ns
 - `InferenceResult` — `{outputs: vector<vector<float>>, latency_ms, success, error_msg}`
 - `TensorInfo` — `{name, shape, dtype, size_bytes}`
 
@@ -83,6 +86,24 @@ This targets TensorRT 10.x. Key differences from older versions:
 Tests in `test_nlp_models.cpp` cover BERT, DistilBERT, GPT-2, T5-small, and ResNet-18. NLP models use int64 inputs packed into float buffers. Models are stored in `models/` (gitignored, ~1.5 GB total).
 
 GPT-2's ONNX export has batch_size=1 hardcoded in output shape, so its dynamic shape profiles must use fixed batch (`batch_dynamic=false` in `make_nlp_profiles()`). Other NLP models support dynamic batch.
+
+## Benchmarking
+
+```bash
+# Run NLP benchmarks (from build directory)
+./benchmarks/benchmark_nlp --model bert --batch 1 --seq-len 128
+
+# Sync mode options: blocking (default), spin, hybrid
+./benchmarks/benchmark_nlp --model bert --sync-mode spin
+./benchmarks/benchmark_nlp --model bert --sync-mode hybrid
+
+# Enable CUDA graph for repeated-shape inference
+./benchmarks/benchmark_nlp --model bert --cuda-graph
+```
+
+Benchmark results (BERT base, batch 1, seq_len 128):
+- Blocking sync: ~0.78ms latency, ~1198 QPS
+- CUDA Graph: ~0.63ms latency, ~1454 QPS (~19% latency reduction)
 
 ## Dependencies
 

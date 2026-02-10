@@ -35,6 +35,7 @@ struct NLPBenchmarkConfig {
     std::string output_json;
     bool use_cuda_graph = false;
     bool compare_precision = false;
+    SyncMode sync_mode = SyncMode::BLOCKING;
 };
 
 struct NLPBenchmarkResult {
@@ -185,10 +186,12 @@ static NLPBenchmarkResult run_benchmark(
         const std::string& precision_str,
         int num_iterations,
         int warmup_iterations,
-        bool use_cuda_graph) {
+        bool use_cuda_graph,
+        SyncMode sync_mode = SyncMode::BLOCKING) {
 
     EngineConfig ecfg;
     ecfg.enable_cuda_graph = use_cuda_graph;
+    ecfg.sync_mode = sync_mode;
     auto engine = InferenceEngine::create(engine_path, ecfg);
 
     // Set shapes
@@ -280,6 +283,7 @@ static void print_usage(const char* prog) {
         << "  --output <path>         Output JSON file path\n"
         << "  --cuda-graph            Enable CUDA graph capture\n"
         << "  --compare-precision     Run both FP32 and FP16, show speedup comparison\n"
+        << "  --sync-mode <mode>      Sync mode: blocking, spin, hybrid (default: blocking)\n"
         << "  --help                  Show this help\n";
 }
 
@@ -307,6 +311,18 @@ static NLPBenchmarkConfig parse_args(int argc, char** argv) {
             cfg.use_cuda_graph = true;
         } else if (arg == "--compare-precision") {
             cfg.compare_precision = true;
+        } else if (arg == "--sync-mode" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "blocking") {
+                cfg.sync_mode = SyncMode::BLOCKING;
+            } else if (mode == "spin") {
+                cfg.sync_mode = SyncMode::SPIN_WAIT;
+            } else if (mode == "hybrid") {
+                cfg.sync_mode = SyncMode::HYBRID;
+            } else {
+                std::cerr << "Unknown sync mode: " << mode << "\n";
+                std::exit(1);
+            }
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -430,7 +446,8 @@ int main(int argc, char** argv) {
                     cfg.precision_str,
                     cfg.num_iterations,
                     cfg.warmup_iterations,
-                    cfg.use_cuda_graph);
+                    cfg.use_cuda_graph,
+                    cfg.sync_mode);
                 all_results.push_back(res);
 
                 std::cout << std::fixed << std::setprecision(2)

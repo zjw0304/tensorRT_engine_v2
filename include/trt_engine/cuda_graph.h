@@ -6,8 +6,10 @@
 #include <trt_engine/logger.h>
 #include <trt_engine/memory.h>
 
+#include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace trt_engine {
@@ -44,6 +46,44 @@ private:
     cudaGraph_t         graph_     = nullptr;
     cudaGraphExec_t     instance_  = nullptr;
     bool                captured_  = false;
+};
+
+// ── CUDA Graph manager for multiple shape configurations ────────────────
+class CudaGraphManager {
+public:
+    CudaGraphManager() = default;
+    ~CudaGraphManager() = default;
+
+    // Not copyable or movable
+    CudaGraphManager(const CudaGraphManager&) = delete;
+    CudaGraphManager& operator=(const CudaGraphManager&) = delete;
+
+    /// Capture a CUDA graph for a specific shape key.
+    bool capture(const std::string& key, nvinfer1::IExecutionContext* context,
+                 cudaStream_t stream);
+
+    /// Launch the cached graph for a given key.
+    bool launch(const std::string& key, cudaStream_t stream);
+
+    /// Check if a graph exists for the given key.
+    bool has_graph(const std::string& key) const;
+
+    /// Remove a cached graph by key.
+    void remove(const std::string& key);
+
+    /// Remove all cached graphs.
+    void clear();
+
+    /// Number of cached graphs.
+    size_t size() const;
+
+    /// Build a key string from shape pairs.
+    static std::string make_key(
+        const std::vector<std::pair<std::string, nvinfer1::Dims>>& shapes);
+
+private:
+    mutable std::mutex mutex_;
+    std::unordered_map<std::string, std::unique_ptr<CudaGraphExecutor>> graphs_;
 };
 
 }  // namespace trt_engine

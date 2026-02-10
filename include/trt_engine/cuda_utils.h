@@ -5,6 +5,7 @@
 #include <trt_engine/types.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -88,6 +89,13 @@ private:
     std::queue<std::shared_ptr<CudaStream>> available_streams_;
     size_t total_size_;
 };
+
+// ── Spin-wait synchronization ────────────────────────────────────────────
+void spin_wait_event(const CudaEvent& event);
+void hybrid_wait_event(const CudaEvent& event, cudaStream_t stream,
+                       uint64_t spin_ns = 100000);
+void sync_stream(CudaStream& stream, CudaEvent& event, SyncMode mode,
+                 uint64_t hybrid_spin_ns = 100000);
 
 // ── Async memcpy helpers ───────────────────────────────────────────────────
 void async_memcpy_h2d(void* dst, const void* src, size_t size, cudaStream_t stream);

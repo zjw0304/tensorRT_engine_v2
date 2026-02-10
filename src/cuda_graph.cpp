@@ -1,5 +1,6 @@
 #include <trt_engine/cuda_graph.h>
 
+#include <sstream>
 #include <stdexcept>
 
 namespace trt_engine {
@@ -118,6 +119,67 @@ void CudaGraphExecutor::reset() {
         graph_ = nullptr;
     }
     captured_ = false;
+}
+
+// ── CudaGraphManager ───────────────────────────────────────────────────
+
+bool CudaGraphManager::capture(const std::string& key,
+                               nvinfer1::IExecutionContext* context,
+                               cudaStream_t stream) {
+    auto executor = std::make_unique<CudaGraphExecutor>();
+    if (!executor->capture(context, stream)) {
+        get_logger().error("CudaGraphManager: capture failed for key: " + key);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    graphs_[key] = std::move(executor);
+    get_logger().info("CudaGraphManager: cached graph for key: " + key);
+    return true;
+}
+
+bool CudaGraphManager::launch(const std::string& key, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = graphs_.find(key);
+    if (it == graphs_.end()) {
+        return false;
+    }
+    return it->second->launch(stream);
+}
+
+bool CudaGraphManager::has_graph(const std::string& key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return graphs_.count(key) > 0;
+}
+
+void CudaGraphManager::remove(const std::string& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    graphs_.erase(key);
+}
+
+void CudaGraphManager::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    graphs_.clear();
+}
+
+size_t CudaGraphManager::size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return graphs_.size();
+}
+
+std::string CudaGraphManager::make_key(
+    const std::vector<std::pair<std::string, nvinfer1::Dims>>& shapes) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < shapes.size(); ++i) {
+        if (i > 0) oss << ',';
+        oss << shapes[i].first << ':';
+        const auto& dims = shapes[i].second;
+        for (int d = 0; d < dims.nbDims; ++d) {
+            if (d > 0) oss << 'x';
+            oss << dims.d[d];
+        }
+    }
+    return oss.str();
 }
 
 }  // namespace trt_engine

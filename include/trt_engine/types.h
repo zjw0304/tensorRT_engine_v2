@@ -12,6 +12,13 @@
 
 namespace trt_engine {
 
+// ── Synchronization modes ─────────────────────────────────────────────────
+enum class SyncMode {
+    BLOCKING,    // cudaStreamSynchronize - yields CPU, lower CPU usage
+    SPIN_WAIT,   // cudaEventQuery busy loop - lowest latency, 100% CPU core
+    HYBRID       // Spin for a threshold, then fall back to blocking
+};
+
 // ── Precision modes ────────────────────────────────────────────────────────
 enum class Precision {
     FP32,
