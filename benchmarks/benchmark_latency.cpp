@@ -213,6 +213,9 @@ int main(int argc, char** argv) {
         dummy_inputs.emplace_back(static_cast<size_t>(vol), 0.5f);
     }
 
+    // Pre-allocate device/pinned buffers for the fast path
+    engine->prepare_buffers();
+
     std::vector<LatencyResult> all_results;
 
     // Synchronous test

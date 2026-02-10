@@ -120,6 +120,9 @@ static ThroughputResult run_throughput_test(
         dummy_inputs.emplace_back(static_cast<size_t>(vol), 0.5f);
     }
 
+    // Pre-allocate device/pinned buffers for the fast path
+    engine->prepare_buffers();
+
     // Warmup
     for (int i = 0; i < warmup_iterations; ++i) {
         engine->infer(dummy_inputs);

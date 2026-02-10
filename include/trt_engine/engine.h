@@ -60,6 +60,11 @@ public:
     // Set input shape for dynamic-shape models
     void set_input_shape(const std::string& name, const std::vector<int>& dims);
 
+    // Pre-allocate device/pinned buffers for the current input shapes.
+    // Call after set_input_shape() and before infer() in perf-critical loops.
+    // This enables the zero-allocation fast path in run_inference().
+    void prepare_buffers();
+
     // Query tensor information
     std::vector<TensorInfo> get_input_info() const;
     std::vector<TensorInfo> get_output_info() const;
@@ -101,6 +106,24 @@ private:
     // Dynamic shape overrides (name -> dims)
     std::mutex                                   shape_mutex_;
     std::unordered_map<std::string, std::vector<int>> shape_overrides_;
+
+    // Pre-allocated inference resources (fast path)
+    struct PreparedBuffers {
+        std::vector<std::string> input_names;
+        std::vector<std::string> output_names;
+        std::vector<DeviceBuffer> input_device_bufs;
+        std::vector<DeviceBuffer> output_device_bufs;
+        std::vector<PinnedBuffer> input_pinned_bufs;
+        std::vector<size_t> input_byte_sizes;
+        std::vector<size_t> output_elem_counts;
+        // Cached shape overrides snapshot (avoids mutex per call)
+        std::vector<std::pair<std::string, nvinfer1::Dims>> cached_shapes;
+        std::unique_ptr<CudaStream> stream;
+        std::unique_ptr<CudaEvent> start_event;
+        std::unique_ptr<CudaEvent> end_event;
+        bool ready = false;
+    };
+    PreparedBuffers prepared_;
 
     // Thread pool for async inference
     std::vector<std::thread>                     workers_;

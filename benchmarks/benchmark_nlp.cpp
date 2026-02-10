@@ -198,6 +198,9 @@ static NLPBenchmarkResult run_benchmark(
         engine->set_input_shape("token_type_ids", {batch_size, seq_length});
     }
 
+    // Pre-allocate device/pinned buffers for the fast path
+    engine->prepare_buffers();
+
     // Create inputs
     int n = batch_size * seq_length;
     auto ids  = create_int64_as_float(

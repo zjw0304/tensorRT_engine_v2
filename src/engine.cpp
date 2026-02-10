@@ -1,6 +1,7 @@
 #include <trt_engine/engine.h>
 
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <numeric>
 #include <sstream>
@@ -203,6 +204,97 @@ void InferenceEngine::set_input_shape(const std::string& name,
                                       const std::vector<int>& dims) {
     std::lock_guard<std::mutex> lock(shape_mutex_);
     shape_overrides_[name] = dims;
+    // Invalidate prepared buffers when shapes change
+    prepared_.ready = false;
+}
+
+// ── Buffer pre-allocation ───────────────────────────────────────────────
+
+void InferenceEngine::prepare_buffers() {
+    CUDA_CHECK(cudaSetDevice(config_.device_id));
+
+    prepared_.input_names.clear();
+    prepared_.output_names.clear();
+    prepared_.input_device_bufs.clear();
+    prepared_.output_device_bufs.clear();
+    prepared_.input_pinned_bufs.clear();
+    prepared_.input_byte_sizes.clear();
+    prepared_.output_elem_counts.clear();
+
+    // Create persistent stream and events if not already created
+    if (!prepared_.stream) {
+        prepared_.stream = std::make_unique<CudaStream>();
+        prepared_.start_event = std::make_unique<CudaEvent>();
+        prepared_.end_event = std::make_unique<CudaEvent>();
+    }
+
+    // Collect tensor names
+    int nb_io = engine_->getNbIOTensors();
+    for (int i = 0; i < nb_io; ++i) {
+        const char* name = engine_->getIOTensorName(i);
+        if (engine_->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT) {
+            prepared_.input_names.emplace_back(name);
+        } else {
+            prepared_.output_names.emplace_back(name);
+        }
+    }
+
+    // We need a temporary context to resolve output shapes
+    auto ctx = acquire_context();
+
+    // Apply shape overrides to context and cache them
+    prepared_.cached_shapes.clear();
+    {
+        std::lock_guard<std::mutex> slock(shape_mutex_);
+        for (auto& [name, dims] : shape_overrides_) {
+            nvinfer1::Dims trt_dims;
+            trt_dims.nbDims = static_cast<int>(dims.size());
+            for (int d = 0; d < trt_dims.nbDims; ++d) {
+                trt_dims.d[d] = dims[d];
+            }
+            ctx->setInputShape(name.c_str(), trt_dims);
+            prepared_.cached_shapes.emplace_back(name, trt_dims);
+        }
+    }
+
+    // Allocate input device buffers and pinned host buffers
+    for (const auto& name : prepared_.input_names) {
+        // Compute size from shape overrides
+        std::lock_guard<std::mutex> slock(shape_mutex_);
+        auto it = shape_overrides_.find(name);
+        size_t byte_size;
+        if (it != shape_overrides_.end()) {
+            int64_t vol = 1;
+            for (int d : it->second) vol *= d;
+            nvinfer1::DataType dt = engine_->getTensorDataType(name.c_str());
+            byte_size = static_cast<size_t>(vol) * datatype_size(dt);
+        } else {
+            nvinfer1::Dims dims = engine_->getTensorShape(name.c_str());
+            int64_t vol = volume(dims);
+            nvinfer1::DataType dt = engine_->getTensorDataType(name.c_str());
+            byte_size = static_cast<size_t>(vol) * datatype_size(dt);
+        }
+        prepared_.input_byte_sizes.push_back(byte_size);
+        prepared_.input_device_bufs.emplace_back(byte_size);
+        prepared_.input_pinned_bufs.emplace_back(byte_size);
+    }
+
+    // Allocate output device buffers
+    for (const auto& name : prepared_.output_names) {
+        nvinfer1::Dims dims = ctx->getTensorShape(name.c_str());
+        int64_t vol = volume(dims);
+        if (vol <= 0) {
+            dims = engine_->getTensorShape(name.c_str());
+            vol = volume(dims);
+        }
+        nvinfer1::DataType dt = engine_->getTensorDataType(name.c_str());
+        size_t byte_size = static_cast<size_t>(vol) * datatype_size(dt);
+        prepared_.output_device_bufs.emplace_back(byte_size);
+        prepared_.output_elem_counts.push_back(static_cast<size_t>(vol));
+    }
+
+    release_context(std::move(ctx));
+    prepared_.ready = true;
 }
 
 // ── Core inference ──────────────────────────────────────────────────────
@@ -212,6 +304,79 @@ InferenceResult InferenceEngine::run_inference(
 
     InferenceResult result;
     result.success = false;
+
+    // Fast path: use pre-allocated buffers
+    if (prepared_.ready) {
+        try {
+            if (input_buffers.size() != prepared_.input_names.size()) {
+                result.error_msg = "Input count mismatch: expected " +
+                                   std::to_string(prepared_.input_names.size()) + " got " +
+                                   std::to_string(input_buffers.size());
+                return result;
+            }
+
+            auto ctx = acquire_context();
+
+            // Apply cached shapes (no mutex needed - snapshot from prepare_buffers)
+            for (const auto& [name, trt_dims] : prepared_.cached_shapes) {
+                ctx->setInputShape(name.c_str(), trt_dims);
+            }
+
+            auto stream = prepared_.stream->get();
+
+            // Copy inputs to pinned memory, then H2D async
+            for (size_t i = 0; i < prepared_.input_names.size(); ++i) {
+                size_t byte_size = input_buffers[i].size() * sizeof(float);
+                std::memcpy(prepared_.input_pinned_bufs[i].data(),
+                            input_buffers[i].data(), byte_size);
+                async_memcpy_h2d(prepared_.input_device_bufs[i].data(),
+                                 prepared_.input_pinned_bufs[i].data(),
+                                 byte_size, stream);
+                ctx->setTensorAddress(prepared_.input_names[i].c_str(),
+                                      prepared_.input_device_bufs[i].data());
+            }
+
+            // Bind outputs
+            for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
+                ctx->setTensorAddress(prepared_.output_names[i].c_str(),
+                                      prepared_.output_device_bufs[i].data());
+            }
+
+            // Measure and run
+            prepared_.start_event->record(stream);
+
+            if (!ctx->enqueueV3(stream)) {
+                result.error_msg = "enqueueV3 failed";
+                release_context(std::move(ctx));
+                return result;
+            }
+
+            prepared_.end_event->record(stream);
+
+            // Copy outputs back to host
+            result.outputs.resize(prepared_.output_names.size());
+            for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
+                result.outputs[i].resize(prepared_.output_elem_counts[i]);
+                async_memcpy_d2h(result.outputs[i].data(),
+                                 prepared_.output_device_bufs[i].data(),
+                                 prepared_.output_elem_counts[i] * sizeof(float),
+                                 stream);
+            }
+
+            prepared_.stream->synchronize();
+            result.latency_ms = CudaEvent::elapsed_time(*prepared_.start_event,
+                                                         *prepared_.end_event);
+            result.success = true;
+
+            release_context(std::move(ctx));
+        } catch (const std::exception& e) {
+            result.error_msg = e.what();
+            result.success = false;
+        }
+        return result;
+    }
+
+    // Slow path: allocate everything per call (original behavior)
 
     try {
         CUDA_CHECK(cudaSetDevice(config_.device_id));
