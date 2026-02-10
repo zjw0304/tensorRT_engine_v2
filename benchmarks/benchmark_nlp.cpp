@@ -36,6 +36,7 @@ struct NLPBenchmarkConfig {
     bool use_cuda_graph = false;
     bool compare_precision = false;
     SyncMode sync_mode = SyncMode::BLOCKING;
+    int opt_level = 3;  // builder optimization level (0-5)
 };
 
 struct NLPBenchmarkResult {
@@ -133,7 +134,8 @@ static std::string build_or_load_engine(
         const std::string& engine_path,
         bool has_token_type_ids,
         bool batch_dynamic,
-        Precision precision) {
+        Precision precision,
+        int opt_level = 3) {
     if (fs::exists(engine_path)) {
         std::cout << "  Loading cached engine: " << engine_path << "\n";
         return engine_path;
@@ -147,6 +149,7 @@ static std::string build_or_load_engine(
     BuilderConfig config;
     config.precision = precision;
     config.max_workspace_size = 1ULL << 30;
+    config.builder_optimization_level = opt_level;
 
     DynamicShapeProfile p;
     if (batch_dynamic) {
@@ -284,6 +287,7 @@ static void print_usage(const char* prog) {
         << "  --cuda-graph            Enable CUDA graph capture\n"
         << "  --compare-precision     Run both FP32 and FP16, show speedup comparison\n"
         << "  --sync-mode <mode>      Sync mode: blocking, spin, hybrid (default: blocking)\n"
+        << "  --opt-level <n>         Builder optimization level 0-5 (default: 3)\n"
         << "  --help                  Show this help\n";
 }
 
@@ -323,6 +327,8 @@ static NLPBenchmarkConfig parse_args(int argc, char** argv) {
                 std::cerr << "Unknown sync mode: " << mode << "\n";
                 std::exit(1);
             }
+        } else if (arg == "--opt-level" && i + 1 < argc) {
+            cfg.opt_level = std::stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -392,7 +398,7 @@ int main(int argc, char** argv) {
         cfg.models_dir + "/" + cfg.model_name + "/model.onnx";
     std::string engine_path =
         cfg.models_dir + "/" + cfg.model_name + "/model_" +
-        cfg.precision_str + ".engine";
+        cfg.precision_str + "_opt" + std::to_string(cfg.opt_level) + ".engine";
 
     if (!fs::exists(onnx_path)) {
         std::cerr << "Error: ONNX model not found: " << onnx_path << "\n";
@@ -402,6 +408,7 @@ int main(int argc, char** argv) {
     std::cout << "=== NLP Benchmark ===\n"
               << "Model:      " << cfg.model_name << "\n"
               << "Precision:  " << cfg.precision_str << "\n"
+              << "Opt Level:  " << cfg.opt_level << "\n"
               << "Iterations: " << cfg.num_iterations << "\n"
               << "Warmup:     " << cfg.warmup_iterations << "\n"
               << "CUDA Graph: " << (cfg.use_cuda_graph ? "Yes" : "No") << "\n\n";
@@ -409,7 +416,8 @@ int main(int argc, char** argv) {
     // Build or load engine
     auto ep = build_or_load_engine(
         onnx_path, engine_path,
-        info.has_token_type_ids, info.batch_dynamic, precision);
+        info.has_token_type_ids, info.batch_dynamic, precision,
+        cfg.opt_level);
     if (ep.empty()) {
         std::cerr << "Error: failed to build engine\n";
         return 1;

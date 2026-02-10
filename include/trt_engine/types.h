@@ -54,6 +54,8 @@ struct BuilderConfig {
     std::string timing_cache_path;
     int         max_aux_streams     = 0;
     bool        strongly_typed      = false;
+    int         builder_optimization_level = 3;  // 0-5, higher = slower build but faster inference
+    bool        auto_timing_cache   = true;       // auto-create timing cache next to ONNX file
 
     std::vector<DynamicShapeProfile> dynamic_shapes;
 };
