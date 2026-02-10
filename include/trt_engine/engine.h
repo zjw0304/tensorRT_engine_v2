@@ -82,6 +82,17 @@ public:
     std::vector<TensorInfo> get_input_info() const;
     std::vector<TensorInfo> get_output_info() const;
 
+    // Zero-copy input access: get writable pointer to pre-allocated pinned input buffer.
+    // Write data directly here, then call infer_prepared() to skip the host-to-pinned memcpy.
+    // Requires prepare_buffers() to have been called first.
+    void*  get_input_buffer(size_t index);
+    size_t get_input_buffer_size(size_t index) const;
+    size_t get_num_inputs() const;
+
+    // Infer using data already written to pinned input buffers via get_input_buffer().
+    // Skips the host-to-pinned memcpy step.
+    InferenceResult infer_prepared();
+
     // Run N warmup iterations
     void warmup(int iterations = 5);
 
@@ -102,6 +113,8 @@ private:
 
     // Internal inference logic
     InferenceResult run_inference(const std::vector<std::vector<float>>& input_buffers);
+    InferenceResult run_prepared_inference(bool skip_h2h_copy,
+        const std::vector<std::vector<float>>* input_buffers);
 
     // Compute volume (product of dims)
     static int64_t volume(const nvinfer1::Dims& dims);

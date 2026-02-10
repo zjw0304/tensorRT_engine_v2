@@ -35,6 +35,7 @@ struct NLPBenchmarkConfig {
     std::string output_json;
     bool use_cuda_graph = false;
     bool compare_precision = false;
+    bool zero_copy = false;
     SyncMode sync_mode = SyncMode::BLOCKING;
 };
 
@@ -44,6 +45,7 @@ struct NLPBenchmarkResult {
     int seq_length;
     std::string precision;
     bool cuda_graph;
+    bool zero_copy;
     double mean_latency_ms;
     double p50_latency_ms;
     double p95_latency_ms;
@@ -187,7 +189,8 @@ static NLPBenchmarkResult run_benchmark(
         int num_iterations,
         int warmup_iterations,
         bool use_cuda_graph,
-        SyncMode sync_mode = SyncMode::BLOCKING) {
+        SyncMode sync_mode = SyncMode::BLOCKING,
+        bool zero_copy = false) {
 
     EngineConfig ecfg;
     ecfg.enable_cuda_graph = use_cuda_graph;
@@ -215,9 +218,22 @@ static NLPBenchmarkResult run_benchmark(
         inputs.push_back(create_int64_as_float(create_zeros(n)));
     }
 
+    // Zero-copy: write inputs directly to pinned buffers once
+    if (zero_copy) {
+        size_t num_inputs = engine->get_num_inputs();
+        for (size_t i = 0; i < num_inputs && i < inputs.size(); ++i) {
+            void* buf = engine->get_input_buffer(i);
+            std::memcpy(buf, inputs[i].data(), inputs[i].size() * sizeof(float));
+        }
+    }
+
     // Warmup
     for (int i = 0; i < warmup_iterations; ++i) {
-        engine->infer(inputs);
+        if (zero_copy) {
+            engine->infer_prepared();
+        } else {
+            engine->infer(inputs);
+        }
     }
 
     // Collect per-iteration latencies
@@ -227,7 +243,12 @@ static NLPBenchmarkResult run_benchmark(
     auto wall_start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < num_iterations; ++i) {
-        auto result = engine->infer(inputs);
+        InferenceResult result;
+        if (zero_copy) {
+            result = engine->infer_prepared();
+        } else {
+            result = engine->infer(inputs);
+        }
         if (!result.success) {
             std::cerr << "  Inference failed at iteration " << i
                       << ": " << result.error_msg << "\n";
@@ -253,6 +274,7 @@ static NLPBenchmarkResult run_benchmark(
     res.seq_length     = seq_length;
     res.precision      = precision_str;
     res.cuda_graph     = use_cuda_graph;
+    res.zero_copy      = zero_copy;
     res.num_iterations = static_cast<int>(latencies.size());
     res.mean_latency_ms = latencies.empty() ? 0.0 : sum / latencies.size();
     res.p50_latency_ms  = percentile(latencies, 50.0);
@@ -282,6 +304,7 @@ static void print_usage(const char* prog) {
         << "  --warmup <n>            Number of warmup iterations (default: 20)\n"
         << "  --output <path>         Output JSON file path\n"
         << "  --cuda-graph            Enable CUDA graph capture\n"
+        << "  --zero-copy             Use zero-copy input path (skip host-to-pinned memcpy)\n"
         << "  --compare-precision     Run both FP32 and FP16, show speedup comparison\n"
         << "  --sync-mode <mode>      Sync mode: blocking, spin, hybrid (default: blocking)\n"
         << "  --help                  Show this help\n";
@@ -309,6 +332,8 @@ static NLPBenchmarkConfig parse_args(int argc, char** argv) {
             cfg.output_json = argv[++i];
         } else if (arg == "--cuda-graph") {
             cfg.use_cuda_graph = true;
+        } else if (arg == "--zero-copy") {
+            cfg.zero_copy = true;
         } else if (arg == "--compare-precision") {
             cfg.compare_precision = true;
         } else if (arg == "--sync-mode" && i + 1 < argc) {
@@ -345,6 +370,7 @@ static std::string results_to_json(
     oss << "  \"iterations\": " << cfg.num_iterations << ",\n";
     oss << "  \"warmup\": " << cfg.warmup_iterations << ",\n";
     oss << "  \"cuda_graph\": " << (cfg.use_cuda_graph ? "true" : "false") << ",\n";
+    oss << "  \"zero_copy\": " << (cfg.zero_copy ? "true" : "false") << ",\n";
     oss << "  \"results\": [\n";
 
     for (size_t i = 0; i < results.size(); ++i) {
@@ -355,6 +381,7 @@ static std::string results_to_json(
         oss << "      \"seq_length\": " << r.seq_length << ",\n";
         oss << "      \"precision\": \"" << r.precision << "\",\n";
         oss << "      \"cuda_graph\": " << (r.cuda_graph ? "true" : "false") << ",\n";
+        oss << "      \"zero_copy\": " << (r.zero_copy ? "true" : "false") << ",\n";
         oss << "      \"mean_latency_ms\": " << r.mean_latency_ms << ",\n";
         oss << "      \"p50_latency_ms\": " << r.p50_latency_ms << ",\n";
         oss << "      \"p95_latency_ms\": " << r.p95_latency_ms << ",\n";
@@ -404,7 +431,8 @@ int main(int argc, char** argv) {
               << "Precision:  " << cfg.precision_str << "\n"
               << "Iterations: " << cfg.num_iterations << "\n"
               << "Warmup:     " << cfg.warmup_iterations << "\n"
-              << "CUDA Graph: " << (cfg.use_cuda_graph ? "Yes" : "No") << "\n\n";
+              << "CUDA Graph: " << (cfg.use_cuda_graph ? "Yes" : "No") << "\n"
+              << "Zero-Copy:  " << (cfg.zero_copy ? "Yes" : "No") << "\n\n";
 
     // Build or load engine
     auto ep = build_or_load_engine(
@@ -447,7 +475,8 @@ int main(int argc, char** argv) {
                     cfg.num_iterations,
                     cfg.warmup_iterations,
                     cfg.use_cuda_graph,
-                    cfg.sync_mode);
+                    cfg.sync_mode,
+                    cfg.zero_copy);
                 all_results.push_back(res);
 
                 std::cout << std::fixed << std::setprecision(2)
