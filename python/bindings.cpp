@@ -105,6 +105,8 @@ PYBIND11_MODULE(trt_engine, m) {
         .def_readwrite("timing_cache_path",  &trt_engine::BuilderConfig::timing_cache_path)
         .def_readwrite("max_aux_streams",    &trt_engine::BuilderConfig::max_aux_streams)
         .def_readwrite("strongly_typed",     &trt_engine::BuilderConfig::strongly_typed)
+        .def_readwrite("builder_optimization_level", &trt_engine::BuilderConfig::builder_optimization_level)
+        .def_readwrite("auto_timing_cache",  &trt_engine::BuilderConfig::auto_timing_cache)
         .def_readwrite("dynamic_shapes",     &trt_engine::BuilderConfig::dynamic_shapes);
 
     py::class_<trt_engine::EngineConfig>(m, "EngineConfig")

@@ -28,6 +28,8 @@ TEST(BuilderConfigTest, DefaultValues) {
     EXPECT_TRUE(config.timing_cache_path.empty());
     EXPECT_EQ(config.max_aux_streams, 0);
     EXPECT_FALSE(config.strongly_typed);
+    EXPECT_EQ(config.builder_optimization_level, 3);
+    EXPECT_TRUE(config.auto_timing_cache);
     EXPECT_TRUE(config.dynamic_shapes.empty());
 }
 

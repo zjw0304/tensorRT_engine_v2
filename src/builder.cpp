@@ -143,10 +143,15 @@ std::vector<char> EngineBuilder::build_engine_from_onnx(
     logger_.info("Max workspace size: " +
                  std::to_string(config.max_workspace_size / (1ULL << 20)) + " MB");
 
-    // --- 6. precision ---
+    // --- 6. builder optimization level ---
+    trt_config->setBuilderOptimizationLevel(config.builder_optimization_level);
+    logger_.info("Builder optimization level: " +
+                 std::to_string(config.builder_optimization_level));
+
+    // --- 7. precision ---
     configure_precision(trt_config.get(), config);
 
-    // --- 7. DLA ---
+    // --- 8. DLA ---
     if (config.enable_dla) {
         if (builder->getNbDLACores() > 0) {
             trt_config->setDefaultDeviceType(nvinfer1::DeviceType::kDLA);
@@ -159,20 +164,27 @@ std::vector<char> EngineBuilder::build_engine_from_onnx(
         }
     }
 
-    // --- 8. auxiliary streams ---
+    // --- 9. auxiliary streams ---
     if (config.max_aux_streams > 0) {
         trt_config->setMaxAuxStreams(config.max_aux_streams);
         logger_.info("Max auxiliary streams: " +
                      std::to_string(config.max_aux_streams));
     }
 
-    // --- 9. dynamic shapes / optimization profiles ---
+    // --- 10. dynamic shapes / optimization profiles ---
     configure_dynamic_shapes(builder.get(), trt_config.get(), network.get(), config);
 
-    // --- 10. timing cache ---
+    // --- 11. timing cache ---
+    std::string effective_timing_cache_path = config.timing_cache_path;
+    if (effective_timing_cache_path.empty() && config.auto_timing_cache) {
+        effective_timing_cache_path =
+            (fs::path(onnx_path).parent_path() / "timing_cache.bin").string();
+        logger_.info("Auto timing cache path: " + effective_timing_cache_path);
+    }
+
     std::vector<char> timing_cache_data;
-    if (!config.timing_cache_path.empty()) {
-        timing_cache_data = load_timing_cache(config.timing_cache_path);
+    if (!effective_timing_cache_path.empty()) {
+        timing_cache_data = load_timing_cache(effective_timing_cache_path);
     }
     nvinfer1::ITimingCache* timing_cache = trt_config->createTimingCache(
         timing_cache_data.data(), timing_cache_data.size());
@@ -182,7 +194,7 @@ std::vector<char> EngineBuilder::build_engine_from_onnx(
                      std::string(timing_cache_data.empty() ? "created" : "loaded"));
     }
 
-    // --- 11. build the serialized network ---
+    // --- 12. build the serialized network ---
     logger_.info("Starting engine build ...");
     std::unique_ptr<nvinfer1::IHostMemory, TRTDeleter> serialized(
         builder->buildSerializedNetwork(*network, *trt_config));
@@ -192,14 +204,14 @@ std::vector<char> EngineBuilder::build_engine_from_onnx(
         return {};
     }
 
-    // --- 12. copy to vector ---
+    // --- 13. copy to vector ---
     std::vector<char> engine_data(
         static_cast<const char*>(serialized->data()),
         static_cast<const char*>(serialized->data()) + serialized->size());
 
-    // --- 13. save timing cache ---
-    if (!config.timing_cache_path.empty()) {
-        save_timing_cache(trt_config.get(), config.timing_cache_path);
+    // --- 14. save timing cache ---
+    if (!effective_timing_cache_path.empty()) {
+        save_timing_cache(trt_config.get(), effective_timing_cache_path);
     }
 
     auto t1 = std::chrono::steady_clock::now();
