@@ -64,6 +64,13 @@ public:
     // Set input shape for dynamic-shape models
     void set_input_shape(const std::string& name, const std::vector<int>& dims);
 
+    // Zero-copy inference: returns pointers to pre-allocated pinned output buffers.
+    // Requires prepare_buffers() to have been called first.
+    // The returned references are valid until the next infer/infer_fast call.
+    // Each pair contains (data pointer, number of float elements).
+    const std::vector<std::pair<const void*, size_t>>& infer_fast(
+        const std::vector<std::vector<float>>& input_buffers);
+
     // Pre-allocate device/pinned buffers for the current input shapes.
     // Call after set_input_shape() and before infer() in perf-critical loops.
     // This enables the zero-allocation fast path in run_inference().
@@ -129,11 +136,15 @@ private:
         std::vector<PinnedBuffer> input_pinned_bufs;
         std::vector<size_t> input_byte_sizes;
         std::vector<size_t> output_elem_counts;
+        std::vector<size_t> output_byte_sizes;         // Pre-computed byte sizes per output
+        std::vector<PinnedBuffer> output_pinned_bufs;  // Pre-allocated pinned output buffers
         // Cached shape overrides snapshot (avoids mutex per call)
         std::vector<std::pair<std::string, nvinfer1::Dims>> cached_shapes;
         std::unique_ptr<CudaStream> stream;
         std::unique_ptr<CudaEvent> start_event;
         std::unique_ptr<CudaEvent> end_event;
+        // Pre-allocated output view for infer_fast()
+        std::vector<std::pair<const void*, size_t>> output_view;
         bool ready = false;
     };
     PreparedBuffers prepared_;

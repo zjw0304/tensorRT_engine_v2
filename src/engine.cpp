@@ -219,8 +219,11 @@ void InferenceEngine::prepare_buffers() {
     prepared_.input_device_bufs.clear();
     prepared_.output_device_bufs.clear();
     prepared_.input_pinned_bufs.clear();
+    prepared_.output_pinned_bufs.clear();
     prepared_.input_byte_sizes.clear();
     prepared_.output_elem_counts.clear();
+    prepared_.output_byte_sizes.clear();
+    prepared_.output_view.clear();
 
     // Create persistent stream and events if not already created
     if (!prepared_.stream) {
@@ -280,7 +283,7 @@ void InferenceEngine::prepare_buffers() {
         prepared_.input_pinned_bufs.emplace_back(byte_size);
     }
 
-    // Allocate output device buffers
+    // Allocate output device buffers and pinned output buffers
     for (const auto& name : prepared_.output_names) {
         nvinfer1::Dims dims = ctx->getTensorShape(name.c_str());
         int64_t vol = volume(dims);
@@ -291,7 +294,16 @@ void InferenceEngine::prepare_buffers() {
         nvinfer1::DataType dt = engine_->getTensorDataType(name.c_str());
         size_t byte_size = static_cast<size_t>(vol) * datatype_size(dt);
         prepared_.output_device_bufs.emplace_back(byte_size);
+        prepared_.output_pinned_bufs.emplace_back(byte_size);
         prepared_.output_elem_counts.push_back(static_cast<size_t>(vol));
+        prepared_.output_byte_sizes.push_back(byte_size);
+    }
+
+    // Build the output view vector (pointers updated after allocation)
+    prepared_.output_view.resize(prepared_.output_names.size());
+    for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
+        prepared_.output_view[i] = {prepared_.output_pinned_bufs[i].data(),
+                                    prepared_.output_elem_counts[i]};
     }
 
     release_context(std::move(ctx));
@@ -604,13 +616,11 @@ InferenceResult InferenceEngine::run_inference(
 
             prepared_.end_event->record(stream);
 
-            // Copy outputs back to host
-            result.outputs.resize(prepared_.output_names.size());
+            // Copy outputs D2H to pre-allocated pinned buffers (fast DMA)
             for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
-                result.outputs[i].resize(prepared_.output_elem_counts[i]);
-                async_memcpy_d2h(result.outputs[i].data(),
+                async_memcpy_d2h(prepared_.output_pinned_bufs[i].data(),
                                  prepared_.output_device_bufs[i].data(),
-                                 prepared_.output_elem_counts[i] * sizeof(float),
+                                 prepared_.output_byte_sizes[i],
                                  stream);
             }
 
@@ -618,6 +628,15 @@ InferenceResult InferenceEngine::run_inference(
                         config_.sync_mode, config_.hybrid_spin_ns);
             result.latency_ms = CudaEvent::elapsed_time(*prepared_.start_event,
                                                          *prepared_.end_event);
+
+            // Copy from pinned buffers to result vectors (CPU-to-CPU memcpy)
+            result.outputs.resize(prepared_.output_names.size());
+            for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
+                result.outputs[i].resize(prepared_.output_elem_counts[i]);
+                std::memcpy(result.outputs[i].data(),
+                            prepared_.output_pinned_bufs[i].data(),
+                            prepared_.output_byte_sizes[i]);
+            }
             result.success = true;
 
             release_context(std::move(ctx));
@@ -777,6 +796,94 @@ std::future<InferenceResult> InferenceEngine::infer_async(
     }
     queue_cv_.notify_one();
     return future;
+}
+
+const std::vector<std::pair<const void*, size_t>>& InferenceEngine::infer_fast(
+    const std::vector<std::vector<float>>& input_buffers) {
+
+    if (!prepared_.ready) {
+        throw EngineException("infer_fast requires prepare_buffers() to be called first");
+    }
+
+    CUDA_CHECK(cudaSetDevice(config_.device_id));
+
+    if (input_buffers.size() != prepared_.input_names.size()) {
+        throw EngineException("Input count mismatch: expected " +
+                              std::to_string(prepared_.input_names.size()) + " got " +
+                              std::to_string(input_buffers.size()));
+    }
+
+    auto ctx = acquire_context();
+
+    // Apply cached shapes
+    for (const auto& [name, trt_dims] : prepared_.cached_shapes) {
+        ctx->setInputShape(name.c_str(), trt_dims);
+    }
+
+    auto stream = prepared_.stream->get();
+
+    // Copy inputs to pinned memory, then H2D async
+    for (size_t i = 0; i < prepared_.input_names.size(); ++i) {
+        size_t byte_size = input_buffers[i].size() * sizeof(float);
+        std::memcpy(prepared_.input_pinned_bufs[i].data(),
+                    input_buffers[i].data(), byte_size);
+        async_memcpy_h2d(prepared_.input_device_bufs[i].data(),
+                         prepared_.input_pinned_bufs[i].data(),
+                         byte_size, stream);
+        ctx->setTensorAddress(prepared_.input_names[i].c_str(),
+                              prepared_.input_device_bufs[i].data());
+    }
+
+    // Bind outputs
+    for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
+        ctx->setTensorAddress(prepared_.output_names[i].c_str(),
+                              prepared_.output_device_bufs[i].data());
+    }
+
+    // Measure and run
+    prepared_.start_event->record(stream);
+
+    // CUDA graph path
+    if (config_.enable_cuda_graph && !prepared_.cached_shapes.empty()) {
+        auto graph_key = CudaGraphManager::make_key(prepared_.cached_shapes);
+        if (graph_manager_.has_graph(graph_key)) {
+            if (!graph_manager_.launch(graph_key, stream)) {
+                release_context(std::move(ctx));
+                throw EngineException("CUDA graph launch failed");
+            }
+        } else {
+            if (!graph_manager_.capture(graph_key, ctx.get(), stream)) {
+                get_logger().warning("CUDA graph capture failed, falling back to enqueueV3");
+                if (!ctx->enqueueV3(stream)) {
+                    release_context(std::move(ctx));
+                    throw EngineException("enqueueV3 failed");
+                }
+            }
+        }
+    } else {
+        if (!ctx->enqueueV3(stream)) {
+            release_context(std::move(ctx));
+            throw EngineException("enqueueV3 failed");
+        }
+    }
+
+    prepared_.end_event->record(stream);
+
+    // Copy outputs D2H to pre-allocated pinned buffers
+    for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
+        async_memcpy_d2h(prepared_.output_pinned_bufs[i].data(),
+                         prepared_.output_device_bufs[i].data(),
+                         prepared_.output_byte_sizes[i],
+                         stream);
+    }
+
+    sync_stream(*prepared_.stream, *prepared_.end_event,
+                config_.sync_mode, config_.hybrid_spin_ns);
+
+    release_context(std::move(ctx));
+
+    // Return view of pinned buffers - no copy needed
+    return prepared_.output_view;
 }
 
 // ── Warmup ──────────────────────────────────────────────────────────────
