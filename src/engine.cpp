@@ -527,6 +527,143 @@ std::vector<InferenceResult> InferenceEngine::infer_pipelined(
     return results;
 }
 
+// ── Zero-copy input access ──────────────────────────────────────────────
+
+void* InferenceEngine::get_input_buffer(size_t index) {
+    if (!prepared_.ready || index >= prepared_.input_pinned_bufs.size()) {
+        throw EngineException("Buffers not prepared or index out of range");
+    }
+    return prepared_.input_pinned_bufs[index].data();
+}
+
+size_t InferenceEngine::get_input_buffer_size(size_t index) const {
+    if (!prepared_.ready || index >= prepared_.input_byte_sizes.size()) {
+        throw EngineException("Buffers not prepared or index out of range");
+    }
+    return prepared_.input_byte_sizes[index];
+}
+
+size_t InferenceEngine::get_num_inputs() const {
+    if (!prepared_.ready) {
+        throw EngineException("Buffers not prepared");
+    }
+    return prepared_.input_names.size();
+}
+
+InferenceResult InferenceEngine::infer_prepared() {
+    return run_prepared_inference(true, nullptr);
+}
+
+// ── Core inference (prepared fast path) ─────────────────────────────────
+
+InferenceResult InferenceEngine::run_prepared_inference(
+    bool skip_h2h_copy,
+    const std::vector<std::vector<float>>* input_buffers) {
+
+    InferenceResult result;
+    result.success = false;
+
+    try {
+        if (!prepared_.ready) {
+            result.error_msg = "Buffers not prepared. Call prepare_buffers() first.";
+            return result;
+        }
+
+        if (!skip_h2h_copy && input_buffers) {
+            if (input_buffers->size() != prepared_.input_names.size()) {
+                result.error_msg = "Input count mismatch: expected " +
+                                   std::to_string(prepared_.input_names.size()) + " got " +
+                                   std::to_string(input_buffers->size());
+                return result;
+            }
+        }
+
+        auto ctx = acquire_context();
+
+        // Apply cached shapes (no mutex needed - snapshot from prepare_buffers)
+        for (const auto& [name, trt_dims] : prepared_.cached_shapes) {
+            ctx->setInputShape(name.c_str(), trt_dims);
+        }
+
+        auto stream = prepared_.stream->get();
+
+        // Copy inputs to pinned memory (unless caller already wrote directly), then H2D async
+        for (size_t i = 0; i < prepared_.input_names.size(); ++i) {
+            size_t byte_size = prepared_.input_byte_sizes[i];
+            if (!skip_h2h_copy && input_buffers) {
+                byte_size = (*input_buffers)[i].size() * sizeof(float);
+                std::memcpy(prepared_.input_pinned_bufs[i].data(),
+                            (*input_buffers)[i].data(), byte_size);
+            }
+            async_memcpy_h2d(prepared_.input_device_bufs[i].data(),
+                             prepared_.input_pinned_bufs[i].data(),
+                             byte_size, stream);
+            ctx->setTensorAddress(prepared_.input_names[i].c_str(),
+                                  prepared_.input_device_bufs[i].data());
+        }
+
+        // Bind outputs
+        for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
+            ctx->setTensorAddress(prepared_.output_names[i].c_str(),
+                                  prepared_.output_device_bufs[i].data());
+        }
+
+        // Measure and run
+        prepared_.start_event->record(stream);
+
+        // CUDA graph path: try to launch a cached graph, or capture one
+        if (config_.enable_cuda_graph && !prepared_.cached_shapes.empty()) {
+            auto graph_key = CudaGraphManager::make_key(prepared_.cached_shapes);
+            if (graph_manager_.has_graph(graph_key)) {
+                if (!graph_manager_.launch(graph_key, stream)) {
+                    result.error_msg = "CUDA graph launch failed";
+                    release_context(std::move(ctx));
+                    return result;
+                }
+            } else {
+                if (!graph_manager_.capture(graph_key, ctx.get(), stream)) {
+                    get_logger().warning("CUDA graph capture failed, falling back to enqueueV3");
+                    if (!ctx->enqueueV3(stream)) {
+                        result.error_msg = "enqueueV3 failed";
+                        release_context(std::move(ctx));
+                        return result;
+                    }
+                }
+            }
+        } else {
+            if (!ctx->enqueueV3(stream)) {
+                result.error_msg = "enqueueV3 failed";
+                release_context(std::move(ctx));
+                return result;
+            }
+        }
+
+        prepared_.end_event->record(stream);
+
+        // Copy outputs back to host
+        result.outputs.resize(prepared_.output_names.size());
+        for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
+            result.outputs[i].resize(prepared_.output_elem_counts[i]);
+            async_memcpy_d2h(result.outputs[i].data(),
+                             prepared_.output_device_bufs[i].data(),
+                             prepared_.output_elem_counts[i] * sizeof(float),
+                             stream);
+        }
+
+        sync_stream(*prepared_.stream, *prepared_.end_event,
+                    config_.sync_mode, config_.hybrid_spin_ns);
+        result.latency_ms = CudaEvent::elapsed_time(*prepared_.start_event,
+                                                     *prepared_.end_event);
+        result.success = true;
+
+        release_context(std::move(ctx));
+    } catch (const std::exception& e) {
+        result.error_msg = e.what();
+        result.success = false;
+    }
+    return result;
+}
+
 // ── Core inference ──────────────────────────────────────────────────────
 
 InferenceResult InferenceEngine::run_inference(
@@ -537,95 +674,7 @@ InferenceResult InferenceEngine::run_inference(
 
     // Fast path: use pre-allocated buffers
     if (prepared_.ready) {
-        try {
-            if (input_buffers.size() != prepared_.input_names.size()) {
-                result.error_msg = "Input count mismatch: expected " +
-                                   std::to_string(prepared_.input_names.size()) + " got " +
-                                   std::to_string(input_buffers.size());
-                return result;
-            }
-
-            auto ctx = acquire_context();
-
-            // Apply cached shapes (no mutex needed - snapshot from prepare_buffers)
-            for (const auto& [name, trt_dims] : prepared_.cached_shapes) {
-                ctx->setInputShape(name.c_str(), trt_dims);
-            }
-
-            auto stream = prepared_.stream->get();
-
-            // Copy inputs to pinned memory, then H2D async
-            for (size_t i = 0; i < prepared_.input_names.size(); ++i) {
-                size_t byte_size = input_buffers[i].size() * sizeof(float);
-                std::memcpy(prepared_.input_pinned_bufs[i].data(),
-                            input_buffers[i].data(), byte_size);
-                async_memcpy_h2d(prepared_.input_device_bufs[i].data(),
-                                 prepared_.input_pinned_bufs[i].data(),
-                                 byte_size, stream);
-                ctx->setTensorAddress(prepared_.input_names[i].c_str(),
-                                      prepared_.input_device_bufs[i].data());
-            }
-
-            // Bind outputs
-            for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
-                ctx->setTensorAddress(prepared_.output_names[i].c_str(),
-                                      prepared_.output_device_bufs[i].data());
-            }
-
-            // Measure and run
-            prepared_.start_event->record(stream);
-
-            // CUDA graph path: try to launch a cached graph, or capture one
-            if (config_.enable_cuda_graph && !prepared_.cached_shapes.empty()) {
-                auto graph_key = CudaGraphManager::make_key(prepared_.cached_shapes);
-                if (graph_manager_.has_graph(graph_key)) {
-                    if (!graph_manager_.launch(graph_key, stream)) {
-                        result.error_msg = "CUDA graph launch failed";
-                        release_context(std::move(ctx));
-                        return result;
-                    }
-                } else {
-                    if (!graph_manager_.capture(graph_key, ctx.get(), stream)) {
-                        get_logger().warning("CUDA graph capture failed, falling back to enqueueV3");
-                        if (!ctx->enqueueV3(stream)) {
-                            result.error_msg = "enqueueV3 failed";
-                            release_context(std::move(ctx));
-                            return result;
-                        }
-                    }
-                }
-            } else {
-                if (!ctx->enqueueV3(stream)) {
-                    result.error_msg = "enqueueV3 failed";
-                    release_context(std::move(ctx));
-                    return result;
-                }
-            }
-
-            prepared_.end_event->record(stream);
-
-            // Copy outputs back to host
-            result.outputs.resize(prepared_.output_names.size());
-            for (size_t i = 0; i < prepared_.output_names.size(); ++i) {
-                result.outputs[i].resize(prepared_.output_elem_counts[i]);
-                async_memcpy_d2h(result.outputs[i].data(),
-                                 prepared_.output_device_bufs[i].data(),
-                                 prepared_.output_elem_counts[i] * sizeof(float),
-                                 stream);
-            }
-
-            sync_stream(*prepared_.stream, *prepared_.end_event,
-                        config_.sync_mode, config_.hybrid_spin_ns);
-            result.latency_ms = CudaEvent::elapsed_time(*prepared_.start_event,
-                                                         *prepared_.end_event);
-            result.success = true;
-
-            release_context(std::move(ctx));
-        } catch (const std::exception& e) {
-            result.error_msg = e.what();
-            result.success = false;
-        }
-        return result;
+        return run_prepared_inference(false, &input_buffers);
     }
 
     // Slow path: allocate everything per call (original behavior)
