@@ -58,20 +58,21 @@ struct NLPModelInfo {
     std::string name;
     int vocab_size;
     bool has_token_type_ids;
+    bool batch_dynamic;       // false = model only supports batch=1
 };
 
 static NLPModelInfo get_model_info(const std::string& model_name) {
     if (model_name == "bert-base")
-        return {"bert-base", 30522, true};
+        return {"bert-base", 30522, true, true};
     if (model_name == "distilbert")
-        return {"distilbert", 30522, false};
+        return {"distilbert", 30522, false, true};
     if (model_name == "gpt2")
-        return {"gpt2", 50257, false};
+        return {"gpt2", 50257, false, false};
     if (model_name == "t5-small")
-        return {"t5-small", 32128, false};
+        return {"t5-small", 32128, false, true};
 
     // Default fallback
-    return {model_name, 30522, false};
+    return {model_name, 30522, false, true};
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -130,6 +131,7 @@ static std::string build_or_load_engine(
         const std::string& onnx_path,
         const std::string& engine_path,
         bool has_token_type_ids,
+        bool batch_dynamic,
         Precision precision) {
     if (fs::exists(engine_path)) {
         std::cout << "  Loading cached engine: " << engine_path << "\n";
@@ -146,9 +148,15 @@ static std::string build_or_load_engine(
     config.max_workspace_size = 1ULL << 30;
 
     DynamicShapeProfile p;
-    p.min_dims = {1, 32};
-    p.opt_dims = {4, 128};
-    p.max_dims = {32, 512};
+    if (batch_dynamic) {
+        p.min_dims = {1, 32};
+        p.opt_dims = {4, 128};
+        p.max_dims = {32, 512};
+    } else {
+        p.min_dims = {1, 32};
+        p.opt_dims = {1, 128};
+        p.max_dims = {1, 512};
+    }
 
     p.name = "input_ids";
     config.dynamic_shapes.push_back(p);
@@ -382,10 +390,18 @@ int main(int argc, char** argv) {
     // Build or load engine
     auto ep = build_or_load_engine(
         onnx_path, engine_path,
-        info.has_token_type_ids, precision);
+        info.has_token_type_ids, info.batch_dynamic, precision);
     if (ep.empty()) {
         std::cerr << "Error: failed to build engine\n";
         return 1;
+    }
+
+    // For models without dynamic batch, only batch=1 is valid.
+    std::vector<int> effective_batch_sizes = cfg.batch_sizes;
+    if (!info.batch_dynamic) {
+        effective_batch_sizes = {1};
+        std::cout << "  Note: " << cfg.model_name
+                  << " only supports batch_size=1\n";
     }
 
     std::vector<NLPBenchmarkResult> all_results;
@@ -403,7 +419,7 @@ int main(int argc, char** argv) {
               << "\n";
     std::cout << std::string(94, '-') << "\n";
 
-    for (int bs : cfg.batch_sizes) {
+    for (int bs : effective_batch_sizes) {
         for (int sl : cfg.seq_lengths) {
             try {
                 auto res = run_benchmark(
