@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+install/
+
+# Version control
+.git/
+.gitignore
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker files (avoid recursive COPY)
+docker/
+
+# Documentation (not needed for build)
+docs/
+research/
+*.md
+
+# Build logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/

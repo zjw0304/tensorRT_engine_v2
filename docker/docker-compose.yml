@@ -1,0 +1,72 @@
+version: "3.8"
+
+services:
+  # Build the project (compile image)
+  compile:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.compile
+    image: trt-engine-compile
+    container_name: trt-engine-compile
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Lightweight runtime image
+  runtime:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.runtime
+    image: trt-engine-runtime
+    container_name: trt-engine-runtime
+    runtime: nvidia
+    depends_on:
+      compile:
+        condition: service_completed_successfully
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Interactive inference shell
+  inference:
+    image: trt-engine-runtime
+    container_name: trt-engine-inference
+    runtime: nvidia
+    stdin_open: true
+    tty: true
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - models:/models
+      - ./:/workspace
+    working_dir: /workspace
+    entrypoint: ["/bin/bash"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  models:
+    driver: local

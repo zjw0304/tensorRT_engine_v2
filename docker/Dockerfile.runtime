@@ -1,0 +1,54 @@
+# =============================================================================
+# TRT Engine - Runtime Dockerfile
+# =============================================================================
+# Lightweight image containing only the built library, headers, and Python
+# bindings. No build tools, source code, or tests are included.
+#
+# Usage:
+#   # First build the compile image to produce artifacts:
+#   docker build -f docker/Dockerfile.compile -t trt-engine-compile ..
+#
+#   # Then build the runtime image:
+#   docker build -f docker/Dockerfile.runtime -t trt-engine-runtime ..
+# =============================================================================
+
+# Use the compile image as source for artifacts
+FROM trt-engine-compile AS compile-stage
+
+# ---------------------------------------------------------------------------
+# Runtime image
+# ---------------------------------------------------------------------------
+FROM nvcr.io/nvidia/tensorrt:24.12-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Copy only the installed artifacts (library, headers, Python package)
+COPY --from=compile-stage /opt/trt_engine/lib/ /opt/trt_engine/lib/
+COPY --from=compile-stage /opt/trt_engine/include/ /opt/trt_engine/include/
+COPY --from=compile-stage /opt/trt_engine/python/ /opt/trt_engine/python/
+
+# Copy cmake package config for downstream consumers (already under lib/)
+
+# Set up runtime environment
+ENV LD_LIBRARY_PATH="/opt/trt_engine/lib:${LD_LIBRARY_PATH}"
+ENV PYTHONPATH="/opt/trt_engine/python:${PYTHONPATH}"
+
+# Update linker cache
+RUN ldconfig
+
+# Create a non-root user for running inference
+RUN useradd -m -s /bin/bash trt_user
+RUN chown -R trt_user:trt_user /opt/trt_engine
+
+# Create directory for model files
+RUN mkdir -p /models && chown trt_user:trt_user /models
+VOLUME ["/models"]
+
+WORKDIR /opt/trt_engine
+
+# Health check: verify the shared library is loadable
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python3 -c "import ctypes; ctypes.CDLL('/opt/trt_engine/lib/libtrt_engine.so')" || exit 1
+
+# Show version info by default
+CMD ["python3", "-c", "import ctypes; lib = ctypes.CDLL('/opt/trt_engine/lib/libtrt_engine.so'); print('trt_engine library loaded successfully'); print('Library path: /opt/trt_engine/lib/libtrt_engine.so')"]

@@ -1,0 +1,102 @@
+# =============================================================================
+# TRT Engine - Compile Dockerfile (Multi-stage Build)
+# =============================================================================
+# Builds the trt_engine library, Python bindings, tests, and benchmarks.
+#
+# Usage:
+#   docker build -f docker/Dockerfile.compile -t trt-engine-compile ..
+#
+# To extract built artifacts:
+#   docker create --name trt-build trt-engine-compile
+#   docker cp trt-build:/opt/trt_engine/install ./install
+#   docker rm trt-build
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build
+# ---------------------------------------------------------------------------
+FROM nvcr.io/nvidia/tensorrt:24.12-py3 AS builder
+
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake \
+        build-essential \
+        libgtest-dev \
+        pybind11-dev \
+        python3-pybind11 \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build GTest from source (some distros only ship sources)
+RUN cd /usr/src/gtest \
+    && cmake -B build -DCMAKE_INSTALL_PREFIX=/usr \
+    && cmake --build build -j"$(nproc)" \
+    && cmake --install build
+
+WORKDIR /opt/trt_engine
+
+# Copy cmake modules first (changes less often, better layer caching)
+COPY cmake/ cmake/
+
+# Copy build configuration
+COPY CMakeLists.txt .
+
+# Copy source code
+COPY include/ include/
+COPY src/ src/
+
+# Copy optional components
+COPY python/ python/
+COPY tests/ tests/
+COPY benchmarks/ benchmarks/
+
+# Configure the build with all features enabled
+RUN cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90" \
+    -DCMAKE_INSTALL_PREFIX=/opt/trt_engine/install \
+    -DTRT_ENGINE_BUILD_PYTHON=ON \
+    -DTRT_ENGINE_BUILD_TESTS=ON \
+    -DTRT_ENGINE_BUILD_BENCHMARKS=ON
+
+# Build the project
+RUN cmake --build build -j"$(nproc)"
+
+# Install to a clean prefix
+RUN cmake --install build
+
+# Copy Python package to install directory
+RUN mkdir -p /opt/trt_engine/install/python/trt_engine && \
+    cp -r python/trt_engine/ /opt/trt_engine/install/python/ && \
+    cp python/setup.py /opt/trt_engine/install/python/
+
+# Copy the compiled Python module if it exists
+RUN find build/ -name "_trt_engine*.so" -exec cp {} /opt/trt_engine/install/python/trt_engine/ \; 2>/dev/null || true
+
+# Copy benchmark binaries
+RUN mkdir -p /opt/trt_engine/install/bin && \
+    find build/benchmarks/ -maxdepth 1 -type f -executable -exec cp {} /opt/trt_engine/install/bin/ \; 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Stage 2: Final compile image (includes tests and full build tree)
+# ---------------------------------------------------------------------------
+FROM nvcr.io/nvidia/tensorrt:24.12-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY --from=builder /opt/trt_engine/install /opt/trt_engine
+
+# Set up library and Python paths
+ENV LD_LIBRARY_PATH="/opt/trt_engine/lib:${LD_LIBRARY_PATH}"
+ENV PYTHONPATH="/opt/trt_engine/python:${PYTHONPATH}"
+
+# Verify the library is loadable
+RUN ldconfig && \
+    ls -la /opt/trt_engine/lib/libtrt_engine.so*
+
+WORKDIR /opt/trt_engine
+
+CMD ["bash"]
