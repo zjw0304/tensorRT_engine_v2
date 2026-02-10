@@ -8,7 +8,7 @@ namespace trt_engine {
 // ── CudaStream ─────────────────────────────────────────────────────────────
 
 CudaStream::CudaStream() {
-    CUDA_CHECK(cudaStreamCreate(&stream_));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
 }
 
 CudaStream::CudaStream(unsigned int flags) {
@@ -50,6 +50,14 @@ void CudaStream::synchronize() {
 
 CudaEvent::CudaEvent() {
     CUDA_CHECK(cudaEventCreate(&event_));
+}
+
+CudaEvent::CudaEvent(Type type) {
+    unsigned int flags = 0;
+    if (type == Type::SYNC_ONLY) {
+        flags = cudaEventDisableTiming;
+    }
+    CUDA_CHECK(cudaEventCreateWithFlags(&event_, flags));
 }
 
 CudaEvent::CudaEvent(unsigned int flags) {

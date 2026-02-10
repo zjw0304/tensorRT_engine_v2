@@ -40,7 +40,10 @@ private:
 // ── RAII CUDA event ────────────────────────────────────────────────────────
 class CudaEvent {
 public:
+    enum class Type { TIMING, SYNC_ONLY };
+
     CudaEvent();
+    explicit CudaEvent(Type type);
     explicit CudaEvent(unsigned int flags);
     ~CudaEvent();
 
