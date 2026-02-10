@@ -296,6 +296,13 @@ void InferenceEngine::prepare_buffers() {
 
     release_context(std::move(ctx));
     prepared_.ready = true;
+
+    // Pre-compute graph key so the hot path avoids ostringstream allocation
+    if (config_.enable_cuda_graph && !prepared_.cached_shapes.empty()) {
+        prepared_.cached_graph_key = CudaGraphManager::make_key(prepared_.cached_shapes);
+    } else {
+        prepared_.cached_graph_key.clear();
+    }
 }
 
 // ── Pipeline pre-allocation ─────────────────────────────────────────────
@@ -577,14 +584,16 @@ InferenceResult InferenceEngine::run_inference(
 
             // CUDA graph path: try to launch a cached graph, or capture one
             if (config_.enable_cuda_graph && !prepared_.cached_shapes.empty()) {
-                auto graph_key = CudaGraphManager::make_key(prepared_.cached_shapes);
-                if (graph_manager_.has_graph(graph_key)) {
-                    if (!graph_manager_.launch(graph_key, stream)) {
-                        result.error_msg = "CUDA graph launch failed";
-                        release_context(std::move(ctx));
-                        return result;
-                    }
+                const auto& graph_key = prepared_.cached_graph_key;
+                int launch_result = graph_manager_.try_launch(graph_key, stream);
+                if (launch_result == 1) {
+                    // Graph launched successfully
+                } else if (launch_result == -1) {
+                    result.error_msg = "CUDA graph launch failed";
+                    release_context(std::move(ctx));
+                    return result;
                 } else {
+                    // Graph not found, capture a new one
                     if (!graph_manager_.capture(graph_key, ctx.get(), stream)) {
                         get_logger().warning("CUDA graph capture failed, falling back to enqueueV3");
                         if (!ctx->enqueueV3(stream)) {

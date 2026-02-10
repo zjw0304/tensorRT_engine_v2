@@ -13,7 +13,7 @@ CudaGraphExecutor::~CudaGraphExecutor() {
 
 bool CudaGraphExecutor::capture(nvinfer1::IExecutionContext* context,
                                 cudaStream_t stream) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
 
     // Destroy any previous capture
     if (instance_) {
@@ -24,7 +24,7 @@ bool CudaGraphExecutor::capture(nvinfer1::IExecutionContext* context,
         cudaGraphDestroy(graph_);
         graph_ = nullptr;
     }
-    captured_ = false;
+    captured_.store(false, std::memory_order_release);
 
     if (!context || !stream) {
         get_logger().error("CudaGraphExecutor::capture: null context or stream");
@@ -80,16 +80,14 @@ bool CudaGraphExecutor::capture(nvinfer1::IExecutionContext* context,
         return false;
     }
 
-    captured_ = true;
+    captured_.store(true, std::memory_order_release);
     get_logger().info("CUDA graph captured successfully");
     return true;
 }
 
 bool CudaGraphExecutor::launch(cudaStream_t stream) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (!captured_ || !instance_) {
-        get_logger().error("CudaGraphExecutor::launch: no graph captured");
+    // Lock-free fast path: instance_ is immutable after capture completes
+    if (!captured_.load(std::memory_order_acquire)) {
         return false;
     }
 
@@ -103,12 +101,13 @@ bool CudaGraphExecutor::launch(cudaStream_t stream) {
 }
 
 bool CudaGraphExecutor::is_captured() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return captured_;
+    return captured_.load(std::memory_order_acquire);
 }
 
 void CudaGraphExecutor::reset() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+
+    captured_.store(false, std::memory_order_release);
 
     if (instance_) {
         cudaGraphExecDestroy(instance_);
@@ -118,7 +117,6 @@ void CudaGraphExecutor::reset() {
         cudaGraphDestroy(graph_);
         graph_ = nullptr;
     }
-    captured_ = false;
 }
 
 // ── CudaGraphManager ───────────────────────────────────────────────────
@@ -145,6 +143,15 @@ bool CudaGraphManager::launch(const std::string& key, cudaStream_t stream) {
         return false;
     }
     return it->second->launch(stream);
+}
+
+int CudaGraphManager::try_launch(const std::string& key, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = graphs_.find(key);
+    if (it == graphs_.end()) {
+        return 0;  // Graph not found
+    }
+    return it->second->launch(stream) ? 1 : -1;
 }
 
 bool CudaGraphManager::has_graph(const std::string& key) const {

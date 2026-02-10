@@ -131,6 +131,8 @@ private:
         std::vector<size_t> output_elem_counts;
         // Cached shape overrides snapshot (avoids mutex per call)
         std::vector<std::pair<std::string, nvinfer1::Dims>> cached_shapes;
+        // Pre-computed graph key from cached_shapes (avoids ostringstream per call)
+        std::string cached_graph_key;
         std::unique_ptr<CudaStream> stream;
         std::unique_ptr<CudaEvent> start_event;
         std::unique_ptr<CudaEvent> end_event;

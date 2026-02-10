@@ -6,8 +6,10 @@
 #include <trt_engine/logger.h>
 #include <trt_engine/memory.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -32,6 +34,8 @@ public:
     bool capture(nvinfer1::IExecutionContext* context, cudaStream_t stream);
 
     /// Launch the captured graph on the given stream.
+    /// Lock-free fast path: after capture, instance_ is immutable so launch
+    /// only needs an atomic check, no mutex.
     /// @return true on success; false if no graph is captured
     bool launch(cudaStream_t stream);
 
@@ -42,10 +46,10 @@ public:
     void reset();
 
 private:
-    mutable std::mutex  mutex_;
-    cudaGraph_t         graph_     = nullptr;
-    cudaGraphExec_t     instance_  = nullptr;
-    bool                captured_  = false;
+    mutable std::shared_mutex mutex_;      // Exclusive for capture/reset, shared not used (atomic fast path instead)
+    cudaGraph_t               graph_     = nullptr;
+    cudaGraphExec_t           instance_  = nullptr;
+    std::atomic<bool>         captured_{false};  // Lock-free fast path check
 };
 
 // ── CUDA Graph manager for multiple shape configurations ────────────────
@@ -64,6 +68,10 @@ public:
 
     /// Launch the cached graph for a given key.
     bool launch(const std::string& key, cudaStream_t stream);
+
+    /// Try to find and launch a cached graph in a single lock acquisition.
+    /// @return 1 = launched successfully, 0 = graph not found, -1 = launch failed
+    int try_launch(const std::string& key, cudaStream_t stream);
 
     /// Check if a graph exists for the given key.
     bool has_graph(const std::string& key) const;
