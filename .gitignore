@@ -33,6 +33,9 @@ dist/
 *.plan
 *.trt
 
+# Model files (download separately)
+models/
+
 # Calibration cache
 *.calibration
 calibration_cache/

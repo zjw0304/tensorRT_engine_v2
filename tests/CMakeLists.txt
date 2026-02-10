@@ -9,6 +9,7 @@ add_executable(trt_engine_tests
     test_cuda_graph.cpp
     test_batcher.cpp
     test_multi_gpu.cpp
+    test_nlp_models.cpp
 )
 
 if(TARGET GTest::GTest)
